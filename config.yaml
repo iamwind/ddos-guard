@@ -1,0 +1,72 @@
+# ddosguard 配置示例
+http:
+  # metrics/health 监听地址；空字符串表示不启用（也可用 -http 参数覆盖）
+  listen: ":8080"
+
+collector:
+  # 推荐：配合 netstream-collector 的 forward_to（原始报文转发），
+  # 仅监听本机回环，不暴露网络面：
+  #   netstream: forward_to: "127.0.0.1:2056"
+  #   ddosguard: listen: "127.0.0.1:2056"
+  # 若 ddosguard 直接接收交换机 NetFlow，则改为 "0.0.0.0:2055"
+  listen: "127.0.0.1:2056"
+  buffer_size: 65535
+  workers: 4
+
+detection:
+  window: "5s"            # 聚合窗口（最近 5 秒）
+  check_interval: "1s"    # 检测周期
+  cooldown: "300s"        # 同一 交换机+IP+端口 命中后的抑制时间
+  # 全局默认阈值（可被每个交换机覆盖；任一条件满足即触发）
+  min_flows: 1000         # 窗口内连接数（flow 数）
+  min_bytes: 20971520     # 窗口内流量（字节，20MB/5s ≈ 32Mbps）
+  min_packets: 0          # 窗口内包数（0=不启用）
+
+switches:
+  # 示例 1：华为 VRP 交换机，高级 ACL 拒绝攻击流量
+  # 每次命中批次内的多条规则都无条件从 800 开始连续编号（800、801、802...），
+  # 下一批次重新从 800 开始，覆盖上一次下发的规则。
+  - name: "sw-core-1"
+    host: "10.0.0.1"
+    port: 22
+    username: "netops"
+    password: "change-me"
+    # private_key: "/etc/ddosguard/id_rsa"   # 私钥认证（优先于密码）
+    timeout: "15s"
+    targets:
+      - "203.0.113.0/24"
+      - "198.51.100.10"          # 单个 IP 自动按 /32
+    # min_flows: 500             # 可选：覆盖全局阈值
+    # min_bytes: 10485760
+    rule_id_start: 800           # ACL rule 起始编号（默认 800，批次内连续分配）
+    ssh_enabled: true            # 是否执行 SSH（false=只检测记录日志，不登录交换机）
+    login_commands: []           # 登录后先执行（如 enable），可留空
+    commands:
+      - "sys"
+      - "acl name DDOS advance"
+      - "rule {rule_id} deny {proto} destination-port eq {port} destination {ip} 0.0.0.0"
+      - "commit"
+      - "quit"
+      - "quit"
+      - "display acl name DDOS | include {rule_id}"
+      - "quit"
+
+  # 示例 2：第二台交换机 + 另一个目标网段（独立 rule 编号）
+  - name: "sw-edge-2"
+    host: "10.0.0.2"
+    port: 22
+    username: "netops"
+    password: "change-me"
+    targets:
+      - "192.0.2.0/24"
+    rule_id_start: 800
+    ssh_enabled: false           # 示例：本交换机只演练/记录，不下发（如待审批）
+    commands:
+      - "sys"
+      - "acl name DDOS advance"
+      - "rule {rule_id} deny {proto} destination-port eq {port} destination {ip} 0.0.0.0"
+      - "commit"
+      - "quit"
+      - "quit"
+      - "display acl name DDOS | include {rule_id}"
+      - "quit"
