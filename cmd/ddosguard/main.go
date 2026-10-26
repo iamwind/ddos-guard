@@ -29,6 +29,12 @@ import (
 	"ddosguard/internal/switchctl"
 )
 
+// task 待解析的报文（含导出设备 IP，用于默认采样率匹配）
+type task struct {
+	data       []byte
+	exporterIP string
+}
+
 // stats 运行指标
 type stats struct {
 	packets   uint64
@@ -126,7 +132,7 @@ func main() {
 	conn.SetReadBuffer(bufSize)
 
 	cache := netflow.NewTemplateCache(30 * time.Minute)
-	taskCh := make(chan []byte, 1024)
+	taskCh := make(chan task, 1024)
 	var wg sync.WaitGroup
 
 	stopCh := make(chan struct{})
@@ -136,18 +142,23 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for pkt := range taskCh {
-				records, err := netflow.Parse(pkt, cache)
+			for t := range taskCh {
+				records, err := netflow.Parse(t.data, cache)
 				if err != nil {
 					atomic.AddUint64(&st.parseErrs, 1)
 					continue
 				}
 				now := time.Now()
-				for _, r := range records {
+				for i := range records {
+					r := &records[i]
 					atomic.AddUint64(&st.records, 1)
 					if r.DstIP == "" || !inTargets(allTargets, r.DstIP) {
 						continue
 					}
+					// 采样处理与 netstream-collector 一致：设备未提供采样率时
+					// 使用按导出设备 IP 的默认采样率，再按采样间隔放大计数
+					r.ApplyDefaultSampling(t.exporterIP, cfg.Sampling.Defaults)
+					r.ScaleSampledCounters()
 					atomic.AddUint64(&st.matched, 1)
 					agg.Add(detect.Key{IP: r.DstIP, Port: r.DstPort}, r.Proto, r.Packets, r.Bytes, now)
 				}
@@ -167,7 +178,7 @@ func main() {
 			default:
 			}
 			conn.SetReadDeadline(time.Now().Add(time.Second))
-			n, _, err := conn.ReadFromUDP(buf)
+			n, src, err := conn.ReadFromUDP(buf)
 			if err != nil {
 				if ne, ok := err.(net.Error); ok && ne.Timeout() {
 					continue
@@ -181,10 +192,13 @@ func main() {
 				}
 			}
 			atomic.AddUint64(&st.packets, 1)
-			pkt := make([]byte, n)
-			copy(pkt, buf[:n])
+			t := task{data: make([]byte, n)}
+			copy(t.data, buf[:n])
+			if src != nil && src.IP != nil {
+				t.exporterIP = src.IP.String()
+			}
 			select {
-			case taskCh <- pkt:
+			case taskCh <- t:
 			default:
 				logger.Warn("worker queue full, packet dropped")
 			}

@@ -142,16 +142,33 @@ func TestDetectorHitAndCooldown(t *testing.T) {
 	}
 }
 
-// TestThresholds 阈值判定（任一条件满足）
+// TestThresholds 阈值判定（**且**关系：所有已启用条件需同时满足）
 func TestThresholds(t *testing.T) {
-	th := Thresholds{MinFlows: 100, MinBytes: 1000}
-	if ok, _ := th.Exceeded(Stats{Flows: 100}); !ok {
-		t.Error("flows threshold not triggered")
+	th := Thresholds{MinFlows: 100, MinBytes: 1000, MinPackets: 50}
+
+	// 全部满足 → 触发
+	if ok, reason := th.Exceeded(Stats{Flows: 100, Bytes: 1000, Packets: 50}); !ok {
+		t.Errorf("all conditions satisfied should trigger: %s", reason)
 	}
-	if ok, _ := th.Exceeded(Stats{Bytes: 1000}); !ok {
-		t.Error("bytes threshold not triggered")
+	// 只满足连接数 → 不触发
+	if ok, _ := th.Exceeded(Stats{Flows: 100, Bytes: 999, Packets: 50}); ok {
+		t.Error("flows only must not trigger (AND)")
 	}
-	if ok, _ := th.Exceeded(Stats{Flows: 99, Bytes: 999}); ok {
-		t.Error("threshold triggered below limits")
+	// 只满足流量 → 不触发
+	if ok, _ := th.Exceeded(Stats{Flows: 99, Bytes: 1000, Packets: 50}); ok {
+		t.Error("bytes only must not trigger (AND)")
+	}
+	// 只满足包数 → 不触发
+	if ok, _ := th.Exceeded(Stats{Flows: 100, Bytes: 1000, Packets: 49}); ok {
+		t.Error("packets only must not trigger (AND)")
+	}
+	// 两项满足、缺一项 → 不触发
+	if ok, _ := th.Exceeded(Stats{Flows: 100, Bytes: 1000}); ok {
+		t.Error("missing packets must not trigger (AND)")
+	}
+	// 未启用的条件（0）忽略：仅 flows 启用
+	th2 := Thresholds{MinFlows: 10}
+	if ok, _ := th2.Exceeded(Stats{Flows: 10}); !ok {
+		t.Error("single enabled condition should trigger")
 	}
 }

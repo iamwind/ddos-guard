@@ -17,6 +17,14 @@ type Config struct {
 	Detection DetectionConfig `yaml:"detection"`
 	Switches  []SwitchConfig  `yaml:"switches"`
 	HTTP      HTTPConfig      `yaml:"http"`
+	Sampling  SamplingConfig  `yaml:"sampling"`
+}
+
+// SamplingConfig 采样配置（与 netstream-collector 相同语义）
+type SamplingConfig struct {
+	// Defaults 设备未在流记录/选项记录中提供采样率时的默认采样间隔
+	// （按导出设备 IP），华为等设备常不提供采样信息。
+	Defaults map[string]int `yaml:"defaults"`
 }
 
 // HTTPConfig metrics/health 监听配置

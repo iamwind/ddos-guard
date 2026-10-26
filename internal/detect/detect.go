@@ -4,6 +4,7 @@ package detect
 import (
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -136,18 +137,32 @@ type Thresholds struct {
 	MinPackets uint64
 }
 
-// Exceeded 判断统计是否超过任一阈值
+// Exceeded 判断统计是否同时满足所有已启用的阈值（**且**关系）：
+// 连接数、流量（字节）、包数量三个条件均需达到各自阈值（0 = 不启用该条件）。
 func (t Thresholds) Exceeded(s Stats) (bool, string) {
-	if t.MinFlows > 0 && s.Flows >= t.MinFlows {
-		return true, fmt.Sprintf("flows %d >= %d", s.Flows, t.MinFlows)
+	var parts []string
+	if t.MinFlows > 0 {
+		if s.Flows < t.MinFlows {
+			return false, ""
+		}
+		parts = append(parts, fmt.Sprintf("flows %d >= %d", s.Flows, t.MinFlows))
 	}
-	if t.MinBytes > 0 && s.Bytes >= t.MinBytes {
-		return true, fmt.Sprintf("bytes %d >= %d", s.Bytes, t.MinBytes)
+	if t.MinBytes > 0 {
+		if s.Bytes < t.MinBytes {
+			return false, ""
+		}
+		parts = append(parts, fmt.Sprintf("bytes %d >= %d", s.Bytes, t.MinBytes))
 	}
-	if t.MinPackets > 0 && s.Packets >= t.MinPackets {
-		return true, fmt.Sprintf("packets %d >= %d", s.Packets, t.MinPackets)
+	if t.MinPackets > 0 {
+		if s.Packets < t.MinPackets {
+			return false, ""
+		}
+		parts = append(parts, fmt.Sprintf("packets %d >= %d", s.Packets, t.MinPackets))
 	}
-	return false, ""
+	if len(parts) == 0 {
+		return false, ""
+	}
+	return true, strings.Join(parts, " && ")
 }
 
 // Rule 一个交换机 + 目标网段 + 阈值 + 命令

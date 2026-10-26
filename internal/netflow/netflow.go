@@ -21,6 +21,11 @@ type Record struct {
 	Bytes   uint64
 	First   int64 // 首包时间（ms epoch），0 表示未知
 	Last    int64 // 末包时间（ms epoch），0 表示未知
+
+	// 采样信息（与 netstream-collector 解码规则一致）：
+	// 采样率 > 1 时按采样间隔放大包/字节计数（由调用方在解析后执行）
+	SamplerInterval uint32
+	SamplerMode     uint8
 }
 
 // 协议版本常量
@@ -45,11 +50,19 @@ type template struct {
 	LastSeen time.Time
 }
 
+// SamplerCtx 采样上下文（来自选项数据记录，按观察域保存）
+type SamplerCtx struct {
+	ID       uint16
+	Mode     uint8
+	Interval uint32
+}
+
 // TemplateCache v9/IPFIX 模板缓存（并发安全）
 type TemplateCache struct {
-	mu        sync.Mutex
-	templates map[uint64]*template
-	timeout   time.Duration
+	mu         sync.Mutex
+	templates  map[uint64]*template
+	samplerCtx map[uint32]*SamplerCtx // 观察域 -> 采样上下文
+	timeout    time.Duration
 }
 
 // NewTemplateCache 创建模板缓存；timeout <= 0 使用 30 分钟
@@ -58,8 +71,9 @@ func NewTemplateCache(timeout time.Duration) *TemplateCache {
 		timeout = 30 * time.Minute
 	}
 	return &TemplateCache{
-		templates: make(map[uint64]*template),
-		timeout:   timeout,
+		templates:  make(map[uint64]*template),
+		samplerCtx: make(map[uint32]*SamplerCtx),
+		timeout:    timeout,
 	}
 }
 
@@ -88,6 +102,20 @@ func (c *TemplateCache) put(version uint8, domainID uint32, t *template) {
 	defer c.mu.Unlock()
 	t.LastSeen = time.Now()
 	c.templates[c.key(version, domainID, t.ID)] = t
+}
+
+// SetSamplerCtx 保存观察域采样上下文
+func (c *TemplateCache) SetSamplerCtx(domainID uint32, ctx *SamplerCtx) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.samplerCtx[domainID] = ctx
+}
+
+// GetSamplerCtx 获取观察域采样上下文
+func (c *TemplateCache) GetSamplerCtx(domainID uint32) *SamplerCtx {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.samplerCtx[domainID]
 }
 
 // Parse 解析数据包，返回流记录
@@ -129,6 +157,8 @@ func parseV5(data []byte) ([]Record, error) {
 	count := int(binary.BigEndian.Uint16(data[2:4]))
 	sysUptime := int64(binary.BigEndian.Uint32(data[4:8]))
 	unixSecs := int64(binary.BigEndian.Uint32(data[8:12]))
+	// v5 头采样间隔（offset 22，与 netstream-collector 一致）
+	samplingInterval := uint32(binary.BigEndian.Uint16(data[22:24]))
 	if count == 0 {
 		return nil, nil
 	}
@@ -152,6 +182,10 @@ func parseV5(data []byte) ([]Record, error) {
 		}
 		r.First = base + int64(binary.BigEndian.Uint32(rec[24:28]))
 		r.Last = base + int64(binary.BigEndian.Uint32(rec[28:32]))
+		if samplingInterval > 0 {
+			r.SamplerInterval = samplingInterval
+			r.SamplerMode = 1 // Random
+		}
 		if r.Proto == 1 || r.Proto == 58 {
 			// ICMP: 端口字段存放 type/code，不作为端口统计
 			r.SrcPort, r.DstPort = 0, 0
@@ -214,9 +248,12 @@ func parseV9(data []byte, cache *TemplateCache) ([]Record, error) {
 			t := cache.get(Version9, domainID, setID)
 			if t != nil {
 				if t.IsOption {
-					// 选项数据（采样器等）与检测无关，跳过
+					// 选项数据记录：提取采样信息到观察域上下文，不产生流
+					parseV9OptionRecords(set, t, domainID, cache)
 				} else {
-					out = append(out, parseV9Records(set, t, base)...)
+					records := parseV9Records(set, t, base)
+					applySamplerCtx(records, cache, domainID)
+					out = append(out, records...)
 				}
 			}
 		}
@@ -326,6 +363,14 @@ func applyField(r *Record, fieldType uint16, data []byte, base int64) {
 		}
 	case fLastSwitched:
 		r.Last = base + int64(readUint(data))
+	case 34, 50: // samplingFlowInterval / flowSamplerRandomInterval（华为常用 IE 34）
+		r.SamplerInterval = uint32(readUint(data))
+	case 35, 49: // samplingAlgorithm / flowSamplerMode
+		if len(data) >= 1 {
+			r.SamplerMode = data[0]
+		}
+	case 48: // flowSamplerID
+		// 仅用于标识采样器，检测无需保存
 	}
 }
 
@@ -372,8 +417,14 @@ func parseIPFIX(data []byte, cache *TemplateCache) ([]Record, error) {
 			parseIPFIXTemplates(set, domainID, cache, setID == ipfixSetOption)
 		case setID >= ipfixDataMin:
 			t := cache.get(Version10, domainID, setID)
-			if t != nil && !t.IsOption {
-				out = append(out, parseIPFIXRecords(set, t, exportTime)...)
+			if t != nil {
+				if t.IsOption {
+					parseIPFIXOptionRecords(set, t, domainID, cache)
+				} else {
+					records := parseIPFIXRecords(set, t, exportTime)
+					applySamplerCtx(records, cache, domainID)
+					out = append(out, records...)
+				}
 			}
 		}
 		offset += setLen
@@ -492,4 +543,127 @@ func readUint(data []byte) uint64 {
 		return binary.BigEndian.Uint64(data)
 	}
 	return 0
+}
+
+// applySamplerCtx 流记录未携带采样率时应用观察域采样上下文（与 netstream 一致）
+func applySamplerCtx(records []Record, cache *TemplateCache, domainID uint32) {
+	ctx := cache.GetSamplerCtx(domainID)
+	if ctx == nil || ctx.Interval == 0 {
+		return
+	}
+	for i := range records {
+		if records[i].SamplerInterval == 0 {
+			records[i].SamplerInterval = ctx.Interval
+			records[i].SamplerMode = ctx.Mode
+		}
+	}
+}
+
+// parseV9OptionRecords 解析 v9 选项数据记录，提取采样信息到观察域上下文
+func parseV9OptionRecords(set []byte, t *template, domainID uint32, cache *TemplateCache) {
+	recLen := int(t.TotalLen)
+	if recLen <= 0 {
+		return
+	}
+	offset := 4
+	for offset+recLen <= len(set) {
+		ctx := &SamplerCtx{}
+		pos := offset
+		for _, f := range t.Fields {
+			if pos+int(f.Length) > len(set) {
+				return
+			}
+			val := set[pos : pos+int(f.Length)]
+			switch f.Type {
+			case 34, 50:
+				ctx.Interval = uint32(readUint(val))
+			case 35, 49:
+				if len(val) >= 1 {
+					ctx.Mode = val[0]
+				}
+			case 48:
+				ctx.ID = uint16(readUint(val))
+			}
+			pos += int(f.Length)
+		}
+		if ctx.Interval > 0 {
+			cache.SetSamplerCtx(domainID, ctx)
+		}
+		offset += recLen
+	}
+}
+
+// parseIPFIXOptionRecords 解析 IPFIX 选项数据记录（支持变长字段），提取采样信息
+func parseIPFIXOptionRecords(set []byte, t *template, domainID uint32, cache *TemplateCache) {
+	offset := 4
+	end := len(set)
+	for offset < end {
+		ctx := &SamplerCtx{}
+		pos := offset
+		ok := true
+		for _, f := range t.Fields {
+			flen := int(f.Length)
+			if f.Length == 0xFFFF {
+				if pos >= end {
+					ok = false
+					break
+				}
+				l := int(set[pos])
+				pos++
+				if l == 255 {
+					if pos+2 > end {
+						ok = false
+						break
+					}
+					l = int(binary.BigEndian.Uint16(set[pos : pos+2]))
+					pos += 2
+				}
+				flen = l
+			}
+			if pos+flen > end {
+				ok = false
+				break
+			}
+			val := set[pos : pos+flen]
+			switch f.Type {
+			case 34, 50:
+				ctx.Interval = uint32(readUint(val))
+			case 35, 49:
+				if len(val) >= 1 {
+					ctx.Mode = val[0]
+				}
+			case 48:
+				ctx.ID = uint16(readUint(val))
+			}
+			pos += flen
+		}
+		if !ok {
+			return
+		}
+		if ctx.Interval > 0 {
+			cache.SetSamplerCtx(domainID, ctx)
+		}
+		offset = pos
+	}
+}
+
+// ScaleSampledCounters 按采样间隔放大包/字节计数（与 netstream-collector 一致）。
+// 设备只对部分包采样导出时，放大后带宽/pps/连接数才反映真实流量。
+func (r *Record) ScaleSampledCounters() {
+	if r.SamplerInterval > 1 {
+		r.Packets *= uint64(r.SamplerInterval)
+		r.Bytes *= uint64(r.SamplerInterval)
+	}
+}
+
+// ApplyDefaultSampling 设备未提供采样率时，按导出设备 IP 应用默认采样率
+// （与 netstream-collector 的 sampling.defaults / ElastiFlow workaround 一致）。
+func (r *Record) ApplyDefaultSampling(exporterIP string, defaults map[string]int) {
+	if r.SamplerInterval != 0 || exporterIP == "" || len(defaults) == 0 {
+		return
+	}
+	if iv, ok := defaults[exporterIP]; ok && iv > 1 {
+		r.SamplerInterval = uint32(iv)
+		r.SamplerMode = 1
+	}
 }

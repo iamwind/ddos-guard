@@ -1,7 +1,7 @@
 # ddosguard 配置示例
 http:
   # metrics/health 监听地址；空字符串表示不启用（也可用 -http 参数覆盖）
-  listen: ":8080"
+  listen: "127.0.0.1:8090"
 
 collector:
   # 推荐：配合 netstream-collector 的 forward_to（原始报文转发），
@@ -17,10 +17,19 @@ detection:
   window: "5s"            # 聚合窗口（最近 5 秒）
   check_interval: "1s"    # 检测周期
   cooldown: "300s"        # 同一 交换机+IP+端口 命中后的抑制时间
-  # 全局默认阈值（可被每个交换机覆盖；任一条件满足即触发）
+  # 全局默认阈值（可被每个交换机覆盖）。
+  # 三个条件为「且」关系：所有已启用(>0)的条件需同时达到才触发。
+  # 0 表示不启用该条件（如 min_packets: 0 时只看连接数与流量）。
   min_flows: 1000         # 窗口内连接数（flow 数）
   min_bytes: 20971520     # 窗口内流量（字节，20MB/5s ≈ 32Mbps）
   min_packets: 0          # 窗口内包数（0=不启用）
+
+sampling:
+  # 与 netstream-collector 一致：设备未在流记录/选项记录中提供采样率时，
+  # 按导出设备 IP 使用默认采样率（华为等设备常不提供采样信息）。
+  # 采样率 > 1 时包/字节计数按采样间隔放大。
+  defaults: {}
+  #  "192.0.2.1": 2048
 
 switches:
   # 示例 1：华为 VRP 交换机，高级 ACL 拒绝攻击流量
