@@ -113,6 +113,11 @@ switches:
   `{ip}` 替换为命中的目标 IP，`{port}` 为端口，`{proto}` 为窗口内主导协议
   （tcp/udp/icmp...，如模板中写死协议则忽略），`{rule_id}` 为固定 rule 编号。
   请按实际设备型号调整命令。
+- **ICMP 规则不带端口**：ICMP/ICMPv6 没有端口概念（端口字段存放的是 type/code），
+  协议为 `icmp`/`icmpv6` 时渲染命令会自动去掉端口片段（如
+  `destination-port eq {port}`、Cisco 风格的 `eq {port}`），只按目标 IP 下发。以上面
+  的命令模板为例，ICMP 命中时实际下发 `rule 800 deny icmp destination 203.0.113.9 0.0.0.0`；
+  TCP/UDP 规则仍保留端口参数。
 
 ## 运行
 
@@ -136,7 +141,7 @@ make test
 
 - `netflow`：v5 解析（含 ICMP 端口处理）、v9 模板/数据/模板持久化、IPFIX 变长字段；
 - `detect`：滑动窗口累计与滚出、阈值判定、冷却抑制、网段过滤、**UDP→解析→检测→处置** 集成链路；
-- `switchctl`：命令模板渲染、**真实 SSH 协议**（内置 mock SSH 服务器）执行与命令核对。
+- `switchctl`：命令模板渲染（含 **ICMP 规则不含端口**）、**真实 SSH 协议**（内置 mock SSH 服务器）执行与命令核对。
 
 ## 端到端验证（本机模拟）
 

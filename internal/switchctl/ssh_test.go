@@ -3,6 +3,7 @@ package switchctl
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -45,6 +46,74 @@ func TestRenderCommands(t *testing.T) {
 	// 协议名映射
 	if ProtoName(6) != "tcp" || ProtoName(17) != "udp" || ProtoName(1) != "icmp" || ProtoName(0) != "ip" {
 		t.Errorf("proto names: %s %s %s", ProtoName(6), ProtoName(17), ProtoName(1))
+	}
+}
+
+// TestRenderCommandsICMP ICMP/ICMPv6 无端口：渲染出的 ACL 规则不带端口参数
+func TestRenderCommandsICMP(t *testing.T) {
+	tmpl := []string{
+		"rule {rule_id} deny {proto} destination-port eq {port} destination {ip} 0.0.0.0",
+		"display acl name DDOS | include {rule_id}",
+	}
+	cases := []struct {
+		name string
+		p    RenderParams
+		want string
+	}{
+		{
+			name: "icmp with port 0",
+			p:    RenderParams{IP: "203.0.113.9", Port: 0, Proto: "icmp", RuleID: 800},
+			want: "rule 800 deny icmp destination 203.0.113.9 0.0.0.0",
+		},
+		{
+			name: "icmp with type/code in port field",
+			p:    RenderParams{IP: "203.0.113.9", Port: 8, Proto: "icmp", RuleID: 801},
+			want: "rule 801 deny icmp destination 203.0.113.9 0.0.0.0",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := RenderCommands(tmpl, tc.p)
+			if len(got) != len(tmpl) {
+				t.Fatalf("len=%d, want %d", len(got), len(tmpl))
+			}
+			if got[0] != tc.want {
+				t.Errorf("rule=%q, want %q", got[0], tc.want)
+			}
+			if strings.Contains(got[0], "destination-port") || strings.Contains(got[0], "eq 0") {
+				t.Errorf("ICMP rule must not contain port clause: %q", got[0])
+			}
+			wantDisplay := fmt.Sprintf("display acl name DDOS | include %d", tc.p.RuleID)
+			if got[1] != wantDisplay {
+				t.Errorf("other command changed: %q, want %q", got[1], wantDisplay)
+			}
+		})
+	}
+
+	// ICMPv6 同样不带端口
+	got := RenderCommands([]string{"rule {rule_id} deny {proto} destination-port eq {port} destination {ip} ::/0"},
+		RenderParams{IP: "2001:db8::1", Port: 128, Proto: "icmpv6", RuleID: 802})
+	if want := "rule 802 deny icmpv6 destination 2001:db8::1 ::/0"; got[0] != want {
+		t.Errorf("icmpv6 rule=%q, want %q", got[0], want)
+	}
+
+	// Cisco 风格 eq {port} 也应去掉
+	got = RenderCommands([]string{"deny {proto} host {ip} eq {port}"},
+		RenderParams{IP: "203.0.113.9", Port: 443, Proto: "icmp", RuleID: 900})
+	if want := "deny icmp host 203.0.113.9"; got[0] != want {
+		t.Errorf("cisco style ICMP rule=%q, want %q", got[0], want)
+	}
+
+	// 非 ICMP 协议保留端口参数
+	got = RenderCommands([]string{"rule {rule_id} deny tcp destination-port eq {port} destination {ip} 0.0.0.0"},
+		RenderParams{IP: "203.0.113.9", Port: 443, Proto: "tcp", RuleID: 800})
+	if !strings.Contains(got[0], "destination-port eq 443") {
+		t.Errorf("tcp rule must keep port: %q", got[0])
+	}
+
+	// 协议名判断
+	if !IsICMPProto("ICMP") || !IsICMPProto(" icmpv6 ") || IsICMPProto("tcp") {
+		t.Error("IsICMPProto mismatch")
 	}
 }
 
@@ -191,6 +260,36 @@ func TestExecutorRun(t *testing.T) {
 	joined := strings.Join(cmds, "\n")
 	if !strings.Contains(joined, "rule 800 deny udp destination-port eq 443 destination 203.0.113.9 0.0.0.0") {
 		t.Errorf("rendered command not received: %q", joined)
+	}
+}
+
+// TestExecutorRunICMP 真实 SSH 下发 ICMP 规则时不带端口参数
+func TestExecutorRunICMP(t *testing.T) {
+	srv := startMockSSH(t)
+	addr := srv.ln.Addr().(*net.TCPAddr)
+	cfg := config.SwitchConfig{
+		Name: "mock", Host: "127.0.0.1", Port: addr.Port, Username: "admin", Password: "secret",
+		Timeout: 5 * time.Second, RuleIDStart: 800,
+		Commands: []string{
+			"sys",
+			"acl name DDOS advance",
+			"rule {rule_id} deny {proto} destination-port eq {port} destination {ip} 0.0.0.0",
+			"quit",
+		},
+	}
+	ex := NewExecutor(cfg, zap.NewNop())
+	// ICMP 流量在 v5 中端口已清零；这里模拟非零端口，确认仍不会写入 ACL
+	hits := []detect.Hit{{Switch: "mock", Key: detect.Key{IP: "203.0.113.9", Port: 8}, Proto: 1}}
+	if err := ex.RunBatch("mock", hits); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	cmds := waitCmds(srv, 4)
+	joined := strings.Join(cmds, "\n")
+	if !strings.Contains(joined, "rule 800 deny icmp destination 203.0.113.9 0.0.0.0") {
+		t.Errorf("ICMP rule without port not received: %q", joined)
+	}
+	if strings.Contains(joined, "destination-port") {
+		t.Errorf("ICMP rule must not contain destination-port: %q", joined)
 	}
 }
 

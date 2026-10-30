@@ -50,6 +50,9 @@ switches:
     rule_id_start: 800           # ACL rule 起始编号（默认 800，批次内连续分配）
     ssh_enabled: true            # 是否执行 SSH（false=只检测记录日志，不登录交换机）
     login_commands: []           # 登录后先执行（如 enable），可留空
+    # 命令模板：支持 {ip}/{port}/{proto}/{rule_id}。
+    # ICMP/ICMPv6 没有端口：协议为 icmp 时自动去掉 destination-port eq {port}
+    # 等端口片段，只按目标 IP 下发（如 rule 800 deny icmp destination <ip> 0.0.0.0）。
     commands:
       - "sys"
       - "acl name DDOS advance"

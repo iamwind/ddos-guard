@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,12 +23,48 @@ import (
 // RenderParams 命令模板参数
 type RenderParams struct {
 	IP     string
-	Port   uint16
+	Port   uint16 // 目标端口（ICMP/ICMPv6 无端口，渲染时忽略）
 	Proto  string // 协议名（tcp/udp/icmp/...），来自窗口内主导协议
 	RuleID int    // ACL rule 编号（从 rule_id_start 开始逐条递增）
 }
 
-// RenderCommands 渲染命令模板：替换 {ip} / {port} / {proto} / {rule_id} 占位符
+// IsICMPProto 判断协议名是否为 ICMP/ICMPv6。
+// 两者都没有端口概念（端口字段存放的是 type/code），写入 ACL 的规则不能带端口参数。
+func IsICMPProto(proto string) bool {
+	switch strings.ToLower(strings.TrimSpace(proto)) {
+	case "icmp", "icmpv6", "icmp6":
+		return true
+	default:
+		return false
+	}
+}
+
+// 端口片段（仅 ICMP 规则需要去掉）：兼容华为/H3C 的
+// destination-port eq {port} 与 Cisco 风格的 eq {port}。
+var portClausePatterns = []*regexp.Regexp{
+	// destination-port eq {port} / source-port eq {port} / dst-port 443 ...
+	regexp.MustCompile(`(?i)\s+(?:(?:destination|dest|dst|source|src)[- ]?port|port)\s+(?:eq|equal|neq|gt|lt|ge|le)\s+(?:\{port\}|\d+)`),
+	// destination-port {port}（不带操作符）
+	regexp.MustCompile(`(?i)\s+(?:(?:destination|dest|dst|source|src)[- ]?port|port)\s+(?:\{port\}|\d+)`),
+	// Cisco 风格：eq {port} / gt {port}
+	regexp.MustCompile(`(?i)\s+(?:eq|equal|neq|gt|lt|ge|le)\s+(?:\{port\}|\d+)`),
+	// 兜底：剩余的 {port} 占位符（不把端口值写入 ICMP 规则）
+	regexp.MustCompile(`(?i)\s+\{port\}`),
+}
+
+// stripPortClause 去掉一行命令模板中的端口片段（ICMP/ICMPv6 无端口）
+func stripPortClause(line string) string {
+	for _, re := range portClausePatterns {
+		line = re.ReplaceAllString(line, "")
+	}
+	// 形如 port={port} 等未匹配到前导空白的写法，也不能把端口写进 ICMP 规则
+	line = strings.ReplaceAll(line, "{port}", "")
+	return strings.TrimRight(line, " \t")
+}
+
+// RenderCommands 渲染命令模板：替换 {ip} / {port} / {proto} / {rule_id} 占位符。
+// ICMP/ICMPv6 没有端口：自动去掉模板中的端口片段（如 destination-port eq {port}），
+// 只按目标 IP 下发规则，例如 `rule 800 deny icmp destination 203.0.113.9 0.0.0.0`。
 func RenderCommands(tmpl []string, p RenderParams) []string {
 	replacer := strings.NewReplacer(
 		"{ip}", p.IP,
@@ -35,8 +72,12 @@ func RenderCommands(tmpl []string, p RenderParams) []string {
 		"{proto}", p.Proto,
 		"{rule_id}", strconv.Itoa(p.RuleID),
 	)
+	icmp := IsICMPProto(p.Proto)
 	out := make([]string, 0, len(tmpl))
 	for _, line := range tmpl {
+		if icmp {
+			line = stripPortClause(line)
+		}
 		out = append(out, replacer.Replace(line))
 	}
 	return out

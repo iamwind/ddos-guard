@@ -80,7 +80,8 @@ type SwitchConfig struct {
 	MinBytes   *uint64 `yaml:"min_bytes"`
 	MinPackets *uint64 `yaml:"min_packets"`
 
-	// 命令模板，支持 {ip} / {port} 占位符
+	// 命令模板，支持 {ip} / {port} / {proto} / {rule_id} 占位符。
+	// ICMP/ICMPv6 无端口，渲染时会自动去掉端口片段（如 destination-port eq {port}）。
 	Commands []string `yaml:"commands"`
 	// 登录后先执行的命令（可选，如 enable）
 	LoginCommands []string `yaml:"login_commands"`
