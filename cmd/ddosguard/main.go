@@ -282,10 +282,13 @@ func inTargets(nets []*net.IPNet, ipStr string) bool {
 // newLogger 结构化日志（高频告警限速）
 func newLogger() *zap.Logger {
 	atom := zap.NewAtomicLevelAt(zap.InfoLevel)
+	// 日志时间使用可读日期格式（本地时区 ISO8601），而非 epoch 时间戳
+	encCfg := zap.NewProductionEncoderConfig()
+	encCfg.EncodeTime = zapcore.ISO8601TimeEncoder
 	cfg := zap.Config{
 		Level:            atom,
 		Encoding:         "json",
-		EncoderConfig:    zap.NewProductionEncoderConfig(),
+		EncoderConfig:    encCfg,
 		OutputPaths:      []string{"stderr"},
 		ErrorOutputPaths: []string{"stderr"},
 	}
